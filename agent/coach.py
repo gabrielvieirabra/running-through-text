@@ -5,6 +5,9 @@ Slice 2 wires the first write-side tool: `register_checkin`. Slice 3 adds
 and `register_injury` to power the strict onboarding wizard, plus a
 per-turn PROFILE STATUS preamble so the same agent can switch between
 wizard mode and normal recommendation mode without a separate code path.
+Slice 5 adds deterministic safety markers (high_pain, high_fatigue,
+volume_jump, compensation_attempt, red_medical_symptoms) injected as a
+preamble per ADR 0003, plus a read-side `get_recent_volume` tool.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from typing import Any, Callable
 from openai import OpenAI
 
 from persistence import db
+from safety import evaluate as evaluate_safety
 
 SYSTEM_PROMPT = """You are a virtual coach specialized in running.
 
@@ -43,9 +47,17 @@ If PROFILE STATUS reports blocking fields missing, you are in **wizard mode**:
 
 Once all 5 blocking fields are filled (PROFILE STATUS says `blocking_complete: YES`), you exit wizard mode and behave normally — give the day's recommendation and run check-in / workout extraction as usual.
 
-Under risk signals (pain >= 5/10, fatigue >= 8, weekly volume increase > 15%, attempt to compensate for a missed workout) you do harm reduction: strongly recommend against the choice, but offer the least-bad option if the runner insists. You NEVER refuse silently.
+## Safety
 
-For red medical symptoms (chest pain, severe dizziness, blood, etc.), you immediately recommend an emergency room visit.
+You may receive SAFETY MARKERS in the context preamble. They are computed deterministically; trust them.
+
+Soft markers (`high_pain`, `high_fatigue`, `volume_jump`, `compensation_attempt`):
+  Apply HARM REDUCTION — strongly advise against the risky choice, explain why briefly, and if the runner insists, offer the least-bad alternative (e.g., cap pace, halve distance, switch to recovery). Never refuse silently. If the runner persists against your advice, register the disagreement in the coach_note (Slice 6 — not yet active).
+
+Red medical symptoms:
+  This is the only case where you HARD REFUSE to prescribe training. Tell the runner to seek immediate medical attention (PT-BR: "procure um pronto-socorro / serviço de emergência"). Do not offer alternative training.
+
+When you need an exact weekly-volume number (e.g. to discuss progression or evaluate a planned increase), call `get_recent_volume(days=N)`. Prefer this over guessing from the recent-workouts list.
 
 You reply in the same language the runner uses (typically Portuguese)."""
 
@@ -345,11 +357,42 @@ REGISTER_INJURY_TOOL: dict[str, Any] = {
     },
 }
 
+# Read-side tool: exact rolling-volume calculator. ADR 0002 says tools are
+# write-side, but explicitly calls out `get_recent_volume` as a calculator
+# exception — the LLM is bad at arithmetic over recent workouts and the
+# answer must be exact.
+GET_RECENT_VOLUME_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "get_recent_volume",
+        "description": (
+            "Sum the runner's realized distance over the last N days. Use "
+            "this whenever you need an exact volume number (e.g. to "
+            "evaluate a planned progression). Returns total_km and "
+            "workout_count."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 60,
+                    "description": "Window length in days, 1-60.",
+                },
+            },
+            "required": ["days"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 TOOLS: list[dict[str, Any]] = [
     REGISTER_CHECKIN_TOOL,
     REGISTER_WORKOUT_TOOL,
     UPDATE_PROFILE_TOOL,
     REGISTER_INJURY_TOOL,
+    GET_RECENT_VOLUME_TOOL,
 ]
 
 
@@ -435,11 +478,20 @@ def _handle_register_injury(user_id: str, args: dict[str, Any]) -> dict[str, Any
     return {"ok": True, "injury_id": injury_id}
 
 
+def _handle_get_recent_volume(user_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    days = args.get("days")
+    if not isinstance(days, int) or days < 1 or days > 60:
+        return {"ok": False, "error": "days must be an integer 1..60"}
+    summary = db.recent_volume(user_id, days)
+    return {"ok": True, **summary}
+
+
 TOOL_HANDLERS: dict[str, Callable[[str, dict[str, Any]], dict[str, Any]]] = {
     "register_checkin": _handle_register_checkin,
     "register_workout": _handle_register_workout,
     "update_profile": _handle_update_profile,
     "register_injury": _handle_register_injury,
+    "get_recent_volume": _handle_get_recent_volume,
 }
 
 
@@ -469,6 +521,85 @@ def build_profile_status_preamble(user_id: str | None) -> str | None:
         f"missing: {missing}. "
         f"cooper_needed: {cooper}."
     )
+
+
+def build_safety_markers_preamble(markers: list[dict] | None) -> str | None:
+    """Format the SAFETY MARKERS preamble for the LLM.
+
+    Returns None when there are no soft markers — we don't want to leak an
+    empty "SAFETY MARKERS ACTIVE" line into the conversation. Red medical
+    symptoms are routed through a separate preamble
+    (`build_red_medical_preamble`) because they imply hard refusal, not
+    harm reduction.
+    """
+    if not markers:
+        return None
+    soft = [m for m in markers if m.get("severity") != "red"]
+    if not soft:
+        return None
+    lines = ["SAFETY MARKERS ACTIVE:"]
+    for m in soft:
+        name = m.get("name", "unknown")
+        detail = m.get("detail", "")
+        if detail:
+            lines.append(f"- {name}: {detail}")
+        else:
+            lines.append(f"- {name}")
+    lines.append("")
+    lines.append("Apply harm reduction per the Safety section below.")
+    return "\n".join(lines)
+
+
+def build_red_medical_preamble(markers: list[dict] | None) -> str | None:
+    """Return the hard-refusal preamble when a red medical marker is active.
+
+    The agent's response under this preamble must direct the runner to
+    emergency care — no alternative training, no harm reduction.
+    """
+    if not markers:
+        return None
+    red = [m for m in markers if m.get("severity") == "red"]
+    if not red:
+        return None
+    details = ", ".join(m.get("detail", m.get("name", "unknown")) for m in red)
+    return (
+        "RED MEDICAL SYMPTOM REPORTED: "
+        f"{details}.\n\n"
+        "Per the Safety section: instruct the runner to seek immediate "
+        "medical attention. Do not prescribe training."
+    )
+
+
+def _safety_preambles_for(user_id: str, latest_user_message: str | None) -> list[str]:
+    """Compute markers and return any preamble strings to inject as system messages.
+
+    Best-effort: any exception (DB unavailable, etc.) is swallowed so the
+    coach turn isn't blocked by safety. Order is soft first, then red —
+    when both are present the LLM sees harm-reduction context before the
+    hard-refusal instruction.
+    """
+    try:
+        markers = evaluate_safety(user_id, latest_user_message)
+    except Exception:  # noqa: BLE001 — never block the turn on a safety failure
+        return []
+    preambles: list[str] = []
+    soft = build_safety_markers_preamble(markers)
+    if soft:
+        preambles.append(soft)
+    red = build_red_medical_preamble(markers)
+    if red:
+        preambles.append(red)
+    return preambles
+
+
+def _latest_user_message(messages: list[dict]) -> str | None:
+    """Pull the most recent user-role message text from the conversation."""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            content = m.get("content")
+            if isinstance(content, str):
+                return content
+    return None
 
 
 def call_coach(
@@ -505,19 +636,33 @@ def call_coach_with_tools(
     again. Repeat until the response is plain text or `max_iterations` is hit.
 
     A PROFILE STATUS preamble is prepended on every call so the agent knows
-    whether it is in wizard mode or normal mode for this turn. The same
-    preamble is recomputed inside the loop after tool calls — `update_profile`
-    or `register_injury` can flip the gate mid-turn, and the next LLM call
-    needs the updated status to decide how to wrap up.
+    whether it is in wizard mode or normal mode for this turn. SAFETY MARKERS
+    (and, for red medical phrases, a hard-refusal preamble) are also injected
+    so the LLM sees the deterministic risk picture per ADR 0003. Both
+    preambles are recomputed inside the loop after tool calls that could
+    change state — `update_profile`/`register_injury` flip the wizard gate;
+    `register_checkin`/`register_workout` can change which safety markers
+    fire — and the next LLM call sees the refreshed context.
     """
     llm = client or _build_client()
 
+    latest_user_msg = _latest_user_message(messages)
+
     def _system_messages() -> list[dict[str, Any]]:
         system: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        preamble = build_profile_status_preamble(user_id)
-        if preamble is not None:
-            system.append({"role": "system", "content": preamble})
+        profile_preamble = build_profile_status_preamble(user_id)
+        if profile_preamble is not None:
+            system.append({"role": "system", "content": profile_preamble})
+        for safety_preamble in _safety_preambles_for(user_id, latest_user_msg):
+            system.append({"role": "system", "content": safety_preamble})
         return system
+
+    def _rebuild_system_prefix(conv: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Strip leading system messages from `conv` and prepend fresh ones."""
+        i = 0
+        while i < len(conv) and conv[i].get("role") == "system":
+            i += 1
+        return [*_system_messages(), *conv[i:]]
 
     conversation: list[dict[str, Any]] = [*_system_messages(), *messages]
 
@@ -557,6 +702,7 @@ def call_coach_with_tools(
         )
 
         profile_touched = False
+        state_touched = False
         for tc in tool_calls:
             name = tc.function.name
             try:
@@ -575,6 +721,11 @@ def call_coach_with_tools(
 
             if name in ("update_profile", "register_injury"):
                 profile_touched = True
+            # Re-evaluate safety after writes that could shift markers.
+            # `update_profile` doesn't matter for safety; `register_injury`
+            # also doesn't (injuries don't drive a marker today).
+            if name in ("register_checkin", "register_workout"):
+                state_touched = True
 
             conversation.append(
                 {
@@ -584,17 +735,12 @@ def call_coach_with_tools(
                 }
             )
 
-        # Refresh the PROFILE STATUS preamble in place if the runner's profile
-        # was just mutated — the next LLM turn should see the new gate state.
-        if profile_touched:
-            refreshed = build_profile_status_preamble(user_id)
-            if refreshed is not None:
-                # The first system message is the main prompt; the second (if
-                # present) is the preamble. Replace it; otherwise append.
-                if len(conversation) >= 2 and conversation[1].get("role") == "system":
-                    conversation[1] = {"role": "system", "content": refreshed}
-                else:
-                    conversation.insert(1, {"role": "system", "content": refreshed})
+        # Refresh the leading system messages if either gate could have
+        # shifted: PROFILE STATUS for profile writes, SAFETY MARKERS for
+        # checkin/workout writes. Cheaper to rebuild the whole prefix in one
+        # pass than to surgically edit by index — same end state for the LLM.
+        if profile_touched or state_touched:
+            conversation = _rebuild_system_prefix(conversation)
 
     # Safety fallback: ran out of iterations without a plain-text reply.
     return ""

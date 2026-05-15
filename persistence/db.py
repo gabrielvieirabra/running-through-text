@@ -372,6 +372,35 @@ def load_recent_workouts(user_id: str, limit: int = 10) -> list[dict]:
     ]
 
 
+def recent_volume(user_id: str, days: int) -> dict:
+    """Sum `distance_km` and count workouts over the last `days` days.
+
+    Window is `date >= CURRENT_DATE - (days - 1)` so `days=1` covers today,
+    `days=7` covers a rolling week including today. Returns zeros (not
+    None) when the runner has no workouts in the window — easier for the
+    LLM to reason about.
+    """
+    with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(distance_km), 0) AS total_km,
+                COUNT(*) AS workout_count
+            FROM workouts
+            WHERE user_id = %s
+              AND date >= CURRENT_DATE - (%s::int - 1)
+            """,
+            (user_id, days),
+        ).fetchone()
+    total_km = float(row[0]) if row and row[0] is not None else 0.0
+    workout_count = int(row[1]) if row and row[1] is not None else 0
+    return {
+        "days": int(days),
+        "total_km": total_km,
+        "workout_count": workout_count,
+    }
+
+
 def load_recent_checkins(user_id: str, limit: int = 10) -> list[dict]:
     """Most recent check-ins first, capped at `limit`. Pains arrive as a Python list."""
     with connection() as conn:

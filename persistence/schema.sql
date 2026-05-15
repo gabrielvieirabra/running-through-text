@@ -2,6 +2,8 @@
 -- Slice 1: users, running_profiles, messages.
 -- Slice 2: checkins (with `pains` JSONB), injuries.
 -- Slice 3: workouts (log of realized runs).
+-- Slice 4: running_profiles tightened with experience_level CHECK and a
+--          positive `injury_history_acknowledged` flag for onboarding gating.
 -- Other tables (coach_notes) arrive in later slices.
 
 CREATE TABLE users (
@@ -15,14 +17,21 @@ CREATE TABLE running_profiles (
     user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     weight_kg NUMERIC,
     height_cm NUMERIC,
-    experience_level TEXT,
+    experience_level TEXT CHECK (
+        experience_level IS NULL
+        OR experience_level IN ('iniciante', 'intermediario', 'avancado')
+    ),
     pace_5k TEXT,
     pace_10k TEXT,
     longest_run_km NUMERIC,
-    weekly_days INT,
+    weekly_days INT CHECK (weekly_days IS NULL OR weekly_days BETWEEN 1 AND 7),
     goal TEXT,
     terrain_access TEXT,
     hr_resting INT,
+    -- Positive signal that the runner addressed injury history during onboarding.
+    -- Flipped to TRUE either by `register_injury` (mentioning a past injury counts)
+    -- or by `update_profile` when the runner explicitly says "no injuries".
+    injury_history_acknowledged BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

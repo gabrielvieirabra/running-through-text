@@ -1,1 +1,1 @@
-# running-throgh-text
+# running-through-text

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "running-through-text"
+version = "0.1.0"
+description = "Conversational virtual coach for road/trail running"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit>=1.40",
+    "openai>=1.50",
+    "python-dotenv>=1.0",
+    "psycopg[binary]>=3.2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent", "persistence", "evals"]

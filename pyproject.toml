@@ -19,3 +19,8 @@ test = ["pytest>=8"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["agent", "persistence", "evals"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests that require a live Postgres connection (skipped by default)",
+]

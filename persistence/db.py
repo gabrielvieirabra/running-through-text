@@ -86,6 +86,102 @@ def register_injury(
     return str(row[0])
 
 
+def register_workout(
+    user_id: str,
+    type: str,
+    *,
+    target_pace: str | None = None,
+    zone: str | None = None,
+    distance_km: float | None = None,
+    duration_min: float | None = None,
+    perceived_effort: int | None = None,
+    notes: str | None = None,
+    date: str | None = None,
+) -> str:
+    """Persist a realized workout row. Returns the new workout's UUID as a string.
+
+    `type` must match the canonical enum in schema.sql (PT-BR domain terms).
+    When `date` is None, the DB's `CURRENT_DATE` default is used.
+    """
+    if date is None:
+        with connection() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO workouts (
+                    user_id, type, target_pace, zone,
+                    distance_km, duration_min, perceived_effort, notes
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    user_id,
+                    type,
+                    target_pace,
+                    zone,
+                    distance_km,
+                    duration_min,
+                    perceived_effort,
+                    notes,
+                ),
+            ).fetchone()
+    else:
+        with connection() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO workouts (
+                    user_id, type, target_pace, zone,
+                    distance_km, duration_min, perceived_effort, notes, date
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    user_id,
+                    type,
+                    target_pace,
+                    zone,
+                    distance_km,
+                    duration_min,
+                    perceived_effort,
+                    notes,
+                    date,
+                ),
+            ).fetchone()
+    return str(row[0])
+
+
+def load_recent_workouts(user_id: str, limit: int = 10) -> list[dict]:
+    """Most recent realized workouts first, capped at `limit`."""
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, date, type, target_pace, zone,
+                   distance_km, duration_min, perceived_effort, notes, created_at
+            FROM workouts
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (user_id, limit),
+        ).fetchall()
+    return [
+        {
+            "id": str(row[0]),
+            "date": row[1],
+            "type": row[2],
+            "target_pace": row[3],
+            "zone": row[4],
+            "distance_km": row[5],
+            "duration_min": row[6],
+            "perceived_effort": row[7],
+            "notes": row[8],
+            "created_at": row[9],
+        }
+        for row in rows
+    ]
+
+
 def load_recent_checkins(user_id: str, limit: int = 10) -> list[dict]:
     """Most recent check-ins first, capped at `limit`. Pains arrive as a Python list."""
     with connection() as conn:

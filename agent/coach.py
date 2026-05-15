@@ -1,10 +1,11 @@
 """Agent loop wrapping OpenRouter (OpenAI-compatible) chat with tool calling.
 
-Slice 2 wires the first write-side tool: `register_checkin`. Injury creation
-is intentionally *not* an LLM-callable tool in this slice — distinguishing
-"today's pain" from "starting an injury record" needs more signal than the
-current agent has; deferred to Slice 4. `register_injury` exists in
-persistence and can be called by tests or future tools.
+Slice 2 wires the first write-side tool: `register_checkin`. Slice 3 adds
+`register_workout` for logging realized runs. Injury creation is intentionally
+*not* an LLM-callable tool yet — distinguishing "today's pain" from "starting
+an injury record" needs more signal than the current agent has; deferred to a
+later slice. `register_injury` exists in persistence and can be called by
+tests or future tools.
 """
 
 from __future__ import annotations
@@ -24,6 +25,8 @@ Your goal is to create safe, progressive, and personalized workouts, adapting th
 You consider: the runner's baseline, recent volume, injuries (active and historical), fatigue, pain, recovery, weekly frequency, goals.
 
 When the runner reports their current state (pain, fatigue, sleep, motivation, soreness), call the `register_checkin` tool to persist what they reported before replying. Fill only fields the runner actually mentioned — leave the rest null. Pain locations and notes stay in the language the runner used.
+
+When the runner reports a run they actually did (e.g. "fiz 6km a 5:30/km hoje" / "I ran 6km today at 5:30/km"), call the `register_workout` tool. Use `register_workout` for completed runs and `register_checkin` for state reports — both can fire from the same message when the runner reports a workout and how they felt. Pick `type` from the canonical taxonomy: `rodagem` (continuous easy/comfortable run, Z2), `longo` (longer continuous run), `regenerativo` (very easy recovery), `fartlek` (free hard/easy alternation), `intervalado` (structured intervals), `tempo` (threshold), `ladeira` (hill repeats), `prova` (official race), `simulado` (race simulation), `outro` (escape hatch — avoid when possible). Default to `rodagem` for an unspecified continuous run at comfortable pace. Only set `date` when the runner explicitly anchors the run on another day (e.g. "ontem", "domingo passado"); otherwise leave it unset and today is assumed.
 
 Under risk signals (pain >= 5/10, fatigue >= 8, weekly volume increase > 15%, attempt to compensate for a missed workout) you do harm reduction: strongly recommend against the choice, but offer the least-bad option if the runner insists. You NEVER refuse silently.
 
@@ -96,7 +99,95 @@ REGISTER_CHECKIN_TOOL: dict[str, Any] = {
     },
 }
 
-TOOLS: list[dict[str, Any]] = [REGISTER_CHECKIN_TOOL]
+# OpenAI-compatible tool schema for realized-workout logging. Matches
+# `workouts` columns from schema.sql. Enum values for `type` are PT-BR by
+# deliberate domain choice (see CONTEXT.md "Workout taxonomy").
+REGISTER_WORKOUT_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "register_workout",
+        "description": (
+            "Persist a realized workout (a run the runner actually did). Call "
+            "this whenever the runner reports a completed run. Pick `type` "
+            "from the canonical PT-BR enum. Only fill fields the runner "
+            "actually mentioned; leave the rest unset."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": [
+                        "rodagem",
+                        "longo",
+                        "regenerativo",
+                        "fartlek",
+                        "intervalado",
+                        "tempo",
+                        "ladeira",
+                        "prova",
+                        "simulado",
+                        "outro",
+                    ],
+                    "description": (
+                        "Canonical workout type. Default to `rodagem` for an "
+                        "unspecified continuous run at comfortable pace."
+                    ),
+                },
+                "distance_km": {
+                    "type": ["number", "null"],
+                    "description": "Distance actually covered, in kilometers.",
+                },
+                "duration_min": {
+                    "type": ["number", "null"],
+                    "description": "Total duration in minutes.",
+                },
+                "target_pace": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Pace as free text in min/km (e.g. `5:30/km`). For "
+                        "interval-shaped workouts a structured plan is OK "
+                        "(e.g. `4:00/km work / 6:00/km rest`)."
+                    ),
+                },
+                "zone": {
+                    "type": ["string", "null"],
+                    "enum": ["Z1", "Z2", "Z3", "Z4", "Z5", None],
+                    "description": (
+                        "Optional physiological zone annotation. Leave unset "
+                        "unless the runner used a zone explicitly."
+                    ),
+                },
+                "perceived_effort": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "maximum": 10,
+                    "description": (
+                        "Post-hoc 'how hard was it' rating, 0-10. Distinct "
+                        "from intensity prescription — only set if the runner "
+                        "described how the effort felt."
+                    ),
+                },
+                "notes": {
+                    "type": ["string", "null"],
+                    "description": "Free-text remarks the runner added.",
+                },
+                "date": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "ISO date (YYYY-MM-DD). Only set when the runner "
+                        "anchors the run on another day (e.g. 'ontem'). "
+                        "Otherwise leave unset and today is assumed."
+                    ),
+                },
+            },
+            "required": ["type"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+TOOLS: list[dict[str, Any]] = [REGISTER_CHECKIN_TOOL, REGISTER_WORKOUT_TOOL]
 
 
 def _build_client() -> OpenAI:
@@ -123,8 +214,24 @@ def _handle_register_checkin(user_id: str, args: dict[str, Any]) -> dict[str, An
     return {"ok": True, "checkin_id": checkin_id}
 
 
+def _handle_register_workout(user_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    workout_id = db.register_workout(
+        user_id=user_id,
+        type=args["type"],
+        target_pace=args.get("target_pace"),
+        zone=args.get("zone"),
+        distance_km=args.get("distance_km"),
+        duration_min=args.get("duration_min"),
+        perceived_effort=args.get("perceived_effort"),
+        notes=args.get("notes"),
+        date=args.get("date"),
+    )
+    return {"ok": True, "workout_id": workout_id}
+
+
 TOOL_HANDLERS: dict[str, Callable[[str, dict[str, Any]], dict[str, Any]]] = {
     "register_checkin": _handle_register_checkin,
+    "register_workout": _handle_register_workout,
 }
 
 

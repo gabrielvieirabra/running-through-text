@@ -1,7 +1,8 @@
 -- MVP schema.
 -- Slice 1: users, running_profiles, messages.
 -- Slice 2: checkins (with `pains` JSONB), injuries.
--- Other tables (workouts, coach_notes) arrive in later slices.
+-- Slice 3: workouts (log of realized runs).
+-- Other tables (coach_notes) arrive in later slices.
 
 CREATE TABLE users (
     id TEXT PRIMARY KEY,
@@ -66,3 +67,36 @@ CREATE TABLE injuries (
 );
 
 CREATE INDEX idx_injuries_user_status ON injuries (user_id, status);
+
+-- Workouts: log of REALIZED runs (B1, ADR 0002). Not planned — no `planned_*`
+-- columns and no `status`. `type` uses canonical PT-BR enum values (CONTEXT.md
+-- "Workout taxonomy"). `target_pace` is free text (ADR 0004): pace is primary,
+-- zone is an optional annotation, RPE is deliberately absent.
+-- `perceived_effort` here is a post-hoc "how hard was it" log field on the
+-- realized workout — NOT RPE-as-intensity-prescription.
+CREATE TABLE workouts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    date DATE NOT NULL DEFAULT CURRENT_DATE,
+    type TEXT NOT NULL CHECK (type IN (
+        'rodagem',
+        'longo',
+        'regenerativo',
+        'fartlek',
+        'intervalado',
+        'tempo',
+        'ladeira',
+        'prova',
+        'simulado',
+        'outro'
+    )),
+    target_pace TEXT,
+    zone TEXT CHECK (zone IS NULL OR zone IN ('Z1', 'Z2', 'Z3', 'Z4', 'Z5')),
+    distance_km NUMERIC,
+    duration_min NUMERIC,
+    perceived_effort INT CHECK (perceived_effort IS NULL OR perceived_effort BETWEEN 0 AND 10),
+    notes TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_workouts_user_date ON workouts (user_id, date);

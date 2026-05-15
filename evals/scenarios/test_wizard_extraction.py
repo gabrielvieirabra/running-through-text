@@ -25,7 +25,11 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from agent import coach
+
+pytestmark = pytest.mark.light
 
 
 def _tool_call(name: str, arguments: dict, call_id: str = "call_1") -> SimpleNamespace:

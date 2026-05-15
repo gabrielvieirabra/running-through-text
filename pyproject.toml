@@ -21,6 +21,13 @@ test = ["pytest>=8"]
 packages = ["agent", "memory", "persistence", "evals", "safety"]
 
 [tool.pytest.ini_options]
+# `pytest evals/` runs everything not marked `integration` by default — the
+# default `-m` selector below excludes the integration marker. Use
+# `pytest -m light`, `-m heavy`, or `-m regression` to scope to a suite.
+addopts = "-m 'not integration'"
 markers = [
-    "integration: tests that require a live Postgres connection (skipped by default)",
+    "light: fast deterministic tests; run on every PR (~30s budget)",
+    "heavy: includes LLM-as-judge or expensive scenarios; nightly",
+    "regression: model regression suite; manual / on model swap",
+    "integration: requires a running Postgres (skipped by default)",
 ]

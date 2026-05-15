@@ -13,9 +13,13 @@ from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from agent import coach
 from memory import coach_note as coach_note_module
 from memory import context as context_module
+
+pytestmark = pytest.mark.light
 
 
 def _tool_call(name: str, arguments: dict, call_id: str = "call_1") -> SimpleNamespace:

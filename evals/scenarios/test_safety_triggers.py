@@ -20,8 +20,12 @@ from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from agent import coach
 from safety import triggers
+
+pytestmark = pytest.mark.light
 
 
 # ---------------------------------------------------------------------------

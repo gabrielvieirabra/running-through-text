@@ -1,0 +1,7 @@
+{
+  "_schema": "Per-test token budgets enforced by cost-category eval tests. Same delta posture as the LLM-judge baselines: change the number on purpose, in a commit, when the underlying model or prompts move.",
+  "extraction_register_checkin": {
+    "prompt_tokens": 5000,
+    "completion_tokens": 500
+  }
+}

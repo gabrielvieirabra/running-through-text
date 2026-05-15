@@ -55,6 +55,7 @@ def _completion(content: str | None, tool_calls: list | None = None) -> SimpleNa
     )
 
 
+@pytest.mark.light
 def test_completed_run_message_triggers_register_workout(monkeypatch):
     # Mocked persistence: capture call args, skip DB.
     register_workout_mock = MagicMock(return_value="workout-uuid-abc")

@@ -7,19 +7,28 @@ per-turn PROFILE STATUS preamble so the same agent can switch between
 wizard mode and normal recommendation mode without a separate code path.
 Slice 5 adds deterministic safety markers (high_pain, high_fatigue,
 volume_jump, compensation_attempt, red_medical_symptoms) injected as a
-preamble per ADR 0003, plus a read-side `get_recent_volume` tool.
+preamble per ADR 0003, plus a read-side `get_recent_volume` tool. Slice 6
+closes the M3 loop: a memory preamble (profile + recent state + latest
+coach note) is injected on every turn, the `update_coach_note` tool lets
+the LLM explicitly flag narrative-worthy events, and the post-reply
+helper `maybe_update_coach_note` rewrites the note on deterministic
+triggers (new_workout / risk_flag / idle / manual).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any, Callable
 
 from openai import OpenAI
 
+from memory.context import build_memory_preamble
 from persistence import db
 from safety import evaluate as evaluate_safety
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are a virtual coach specialized in running.
 
@@ -52,12 +61,16 @@ Once all 5 blocking fields are filled (PROFILE STATUS says `blocking_complete: Y
 You may receive SAFETY MARKERS in the context preamble. They are computed deterministically; trust them.
 
 Soft markers (`high_pain`, `high_fatigue`, `volume_jump`, `compensation_attempt`):
-  Apply HARM REDUCTION — strongly advise against the risky choice, explain why briefly, and if the runner insists, offer the least-bad alternative (e.g., cap pace, halve distance, switch to recovery). Never refuse silently. If the runner persists against your advice, register the disagreement in the coach_note (Slice 6 — not yet active).
+  Apply HARM REDUCTION — strongly advise against the risky choice, explain why briefly, and if the runner insists, offer the least-bad alternative (e.g., cap pace, halve distance, switch to recovery). Never refuse silently. If the runner persists against your advice, call `update_coach_note` with a short `reason` describing the disagreement so it is recorded in the long-term note.
 
 Red medical symptoms:
   This is the only case where you HARD REFUSE to prescribe training. Tell the runner to seek immediate medical attention (PT-BR: "procure um pronto-socorro / serviço de emergência"). Do not offer alternative training.
 
 When you need an exact weekly-volume number (e.g. to discuss progression or evaluate a planned increase), call `get_recent_volume(days=N)`. Prefer this over guessing from the recent-workouts list.
+
+## Memory
+
+Each turn you also receive a memory preamble with the runner's profile snapshot, active injuries, recent check-ins and workouts, and the latest COACH NOTE — a narrative summary you yourself maintain across sessions. Use it. It is the authoritative record of "how training has been going". If a narrative-worthy event happens (a disagreement registered against your advice, a phase shift, a chronic-pain flare, the runner clearly insisting on something you advised against), call `update_coach_note` with a short `reason`. Routine updates after a workout or risk check-in happen automatically — do not call `update_coach_note` for those.
 
 You reply in the same language the runner uses (typically Portuguese)."""
 
@@ -387,12 +400,45 @@ GET_RECENT_VOLUME_TOOL: dict[str, Any] = {
     },
 }
 
+# LLM-callable trigger for a narrative coach-note refresh. The actual
+# rewrite is queued on the loop state and runs after the conversation
+# ends — see `_handle_update_coach_note` and `maybe_update_coach_note`.
+# Per ADR 0003 this is the explicit override path for disagreements; the
+# auto triggers (new_workout / risk_flag / idle) cover the rest.
+UPDATE_COACH_NOTE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "update_coach_note",
+        "description": (
+            "Mark that the coach note should be refreshed because something "
+            "narrative-worthy happened (e.g. the runner insisted on training "
+            "against your advice — record the disagreement). Triggers a note "
+            "rewrite outside the runner-facing reply."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Short description of what changed and should be "
+                        "recorded in the note."
+                    ),
+                },
+            },
+            "required": ["reason"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 TOOLS: list[dict[str, Any]] = [
     REGISTER_CHECKIN_TOOL,
     REGISTER_WORKOUT_TOOL,
     UPDATE_PROFILE_TOOL,
     REGISTER_INJURY_TOOL,
     GET_RECENT_VOLUME_TOOL,
+    UPDATE_COACH_NOTE_TOOL,
 ]
 
 
@@ -486,12 +532,28 @@ def _handle_get_recent_volume(user_id: str, args: dict[str, Any]) -> dict[str, A
     return {"ok": True, **summary}
 
 
+def _handle_update_coach_note(user_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    """LLM hook that requests a `manual` rewrite of the coach note.
+
+    The actual rewrite is deferred — it gets queued on the loop's
+    `tool_calls_made` set and executed once after the runner-facing reply
+    is rendered (see `maybe_update_coach_note`). Doing it here would cost
+    the runner an extra LLM round-trip of latency for a non-user-visible
+    write; deferring keeps it out of the hot path.
+    """
+    reason = (args.get("reason") or "").strip()
+    if not reason:
+        return {"ok": False, "error": "reason is required"}
+    return {"ok": True, "queued_trigger": "manual", "reason": reason}
+
+
 TOOL_HANDLERS: dict[str, Callable[[str, dict[str, Any]], dict[str, Any]]] = {
     "register_checkin": _handle_register_checkin,
     "register_workout": _handle_register_workout,
     "update_profile": _handle_update_profile,
     "register_injury": _handle_register_injury,
     "get_recent_volume": _handle_get_recent_volume,
+    "update_coach_note": _handle_update_coach_note,
 }
 
 
@@ -628,6 +690,7 @@ def call_coach_with_tools(
     model: str | None = None,
     client: OpenAI | None = None,
     max_iterations: int = 5,
+    tool_calls_seen: set[str] | None = None,
 ) -> str:
     """Run the tool-using agent loop and return the final assistant text.
 
@@ -638,23 +701,54 @@ def call_coach_with_tools(
     A PROFILE STATUS preamble is prepended on every call so the agent knows
     whether it is in wizard mode or normal mode for this turn. SAFETY MARKERS
     (and, for red medical phrases, a hard-refusal preamble) are also injected
-    so the LLM sees the deterministic risk picture per ADR 0003. Both
-    preambles are recomputed inside the loop after tool calls that could
-    change state — `update_profile`/`register_injury` flip the wizard gate;
-    `register_checkin`/`register_workout` can change which safety markers
-    fire — and the next LLM call sees the refreshed context.
+    so the LLM sees the deterministic risk picture per ADR 0003. The MEMORY
+    preamble (profile + recent state + latest coach note) is also injected
+    every turn so the agent has the M3 summary in hand (ADR 0001).
+
+    All three preambles are recomputed inside the loop after tool calls
+    that could change state — `update_profile`/`register_injury` flip the
+    wizard gate and the memory snapshot; `register_checkin`/`register_workout`
+    change safety markers and the memory snapshot. `get_recent_volume` is
+    read-only and never triggers a rebuild.
+
+    If a `tool_calls_seen` set is passed in, the names of every tool the
+    LLM invoked during the loop are recorded into it — used by the caller
+    (e.g. Streamlit's `maybe_update_coach_note`) to decide whether to
+    queue a post-reply coach-note rewrite.
     """
     llm = client or _build_client()
 
     latest_user_msg = _latest_user_message(messages)
 
     def _system_messages() -> list[dict[str, Any]]:
-        system: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # Order (per Slice 6): SAFETY first when red, then SYSTEM_PROMPT,
+        # PROFILE STATUS, the soft SAFETY MARKERS, then MEMORY. The system
+        # prompt itself documents the Safety section, so SAFETY MARKERS
+        # right before MEMORY is fine — the LLM reads the prompt + markers
+        # together. We keep RED before everything else so the hard-refusal
+        # instruction is unmissable.
+        red_first: list[dict[str, Any]] = []
+        soft_markers: list[dict[str, Any]] = []
+        for safety_preamble in _safety_preambles_for(user_id, latest_user_msg):
+            if "RED MEDICAL SYMPTOM" in safety_preamble:
+                red_first.append({"role": "system", "content": safety_preamble})
+            else:
+                soft_markers.append({"role": "system", "content": safety_preamble})
+
+        system: list[dict[str, Any]] = []
+        system.extend(red_first)
+        system.append({"role": "system", "content": SYSTEM_PROMPT})
         profile_preamble = build_profile_status_preamble(user_id)
         if profile_preamble is not None:
             system.append({"role": "system", "content": profile_preamble})
-        for safety_preamble in _safety_preambles_for(user_id, latest_user_msg):
-            system.append({"role": "system", "content": safety_preamble})
+        system.extend(soft_markers)
+        # Memory preamble is best-effort: never block the turn on a DB miss.
+        try:
+            memory_preamble = build_memory_preamble(user_id)
+        except Exception:  # noqa: BLE001
+            memory_preamble = None
+        if memory_preamble:
+            system.append({"role": "system", "content": memory_preamble})
         return system
 
     def _rebuild_system_prefix(conv: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -719,11 +813,16 @@ def call_coach_with_tools(
                 except Exception as exc:  # noqa: BLE001 — surface error back to the LLM
                     result = {"ok": False, "error": str(exc)}
 
+            if tool_calls_seen is not None and (
+                not isinstance(result, dict) or result.get("ok") is not False
+            ):
+                tool_calls_seen.add(name)
+
             if name in ("update_profile", "register_injury"):
                 profile_touched = True
-            # Re-evaluate safety after writes that could shift markers.
-            # `update_profile` doesn't matter for safety; `register_injury`
-            # also doesn't (injuries don't drive a marker today).
+            # Re-evaluate safety + memory after writes that could shift them.
+            # `update_profile` doesn't move safety but does move memory;
+            # `register_checkin`/`register_workout` move both.
             if name in ("register_checkin", "register_workout"):
                 state_touched = True
 
@@ -735,10 +834,10 @@ def call_coach_with_tools(
                 }
             )
 
-        # Refresh the leading system messages if either gate could have
-        # shifted: PROFILE STATUS for profile writes, SAFETY MARKERS for
-        # checkin/workout writes. Cheaper to rebuild the whole prefix in one
-        # pass than to surgically edit by index — same end state for the LLM.
+        # Refresh the leading system messages whenever any write tool fired,
+        # so the next LLM call sees the new state (PROFILE STATUS, SAFETY
+        # MARKERS, MEMORY). Cheaper to rebuild the whole prefix than to
+        # surgically edit by index — same end state for the LLM.
         if profile_touched or state_touched:
             conversation = _rebuild_system_prefix(conversation)
 
@@ -758,6 +857,78 @@ WIZARD_OPENER_NUDGE = (
     "missing blocking fields per PROFILE STATUS (group them in 2-3 questions, "
     "not 5). Do not prescribe a workout yet unless cooper_needed: YES."
 )
+
+
+def maybe_update_coach_note(
+    user_id: str,
+    tool_calls_made: set[str],
+    *,
+    db_module: Any = db,
+    idle_threshold_days: int = 7,
+    rewrite_fn: Callable[..., Any] | None = None,
+) -> list[str]:
+    """Post-reply trigger check + rewrite.
+
+    Called by the Streamlit app AFTER `call_coach_with_tools` returns, with
+    the set of tool names the loop observed. Picks the strongest trigger
+    that fits this turn and calls the rewrite path once — even when both
+    `new_workout` and `risk_flag` apply, a single rewrite covers both (the
+    note is a full rewrite, not a delta).
+
+    Trigger precedence (returns the trigger(s) that were executed):
+      `manual` > `risk_flag` > `new_workout` > `idle`
+
+    `db_module` and `rewrite_fn` are injectable for tests.
+    """
+    # Local import avoids a circular dependency at module load time
+    # (memory.coach_note → persistence → ... — fine, but importing memory
+    # at the top of `agent/coach.py` is enough; the rewrite_fn override
+    # path keeps tests light).
+    if rewrite_fn is None:
+        from memory.coach_note import rewrite_coach_note as default_rewrite
+
+        rewrite_fn = default_rewrite
+
+    executed: list[str] = []
+
+    chosen: str | None = None
+    if "update_coach_note" in tool_calls_made:
+        chosen = "manual"
+    elif "register_checkin" in tool_calls_made:
+        # We don't re-derive whether a risk marker fires here — the system
+        # prompt already saw the SAFETY MARKERS preamble. For the rewrite
+        # we just check whether any soft marker is currently active so we
+        # only spend an LLM call when there's signal worth recording.
+        try:
+            markers = evaluate_safety(user_id, None)
+        except Exception:  # noqa: BLE001
+            markers = []
+        soft_active = any(m.get("severity") != "red" for m in markers)
+        if soft_active:
+            chosen = "risk_flag"
+        elif "register_workout" in tool_calls_made:
+            chosen = "new_workout"
+    elif "register_workout" in tool_calls_made:
+        chosen = "new_workout"
+    else:
+        # Idle path — only when no write fired this turn.
+        try:
+            days = db_module.days_since_last_coach_note(user_id)
+        except Exception:  # noqa: BLE001
+            days = None
+        if days is None or days >= idle_threshold_days:
+            chosen = "idle"
+
+    if chosen is None:
+        return executed
+
+    try:
+        rewrite_fn(user_id=user_id, trigger=chosen, db_module=db_module)
+        executed.append(chosen)
+    except Exception:  # noqa: BLE001 — never block the runner reply on a note rewrite
+        logger.exception("coach_note rewrite failed for user_id=%s trigger=%s", user_id, chosen)
+
+    return executed
 
 
 def open_wizard(

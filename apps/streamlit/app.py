@@ -3,7 +3,11 @@ import uuid
 import streamlit as st
 from dotenv import load_dotenv
 
-from agent.coach import call_coach_with_tools, open_wizard
+from agent.coach import (
+    call_coach_with_tools,
+    maybe_update_coach_note,
+    open_wizard,
+)
 from persistence.db import (
     ensure_user,
     load_messages,
@@ -15,7 +19,7 @@ load_dotenv()
 
 st.set_page_config(page_title="Running Through Text", page_icon="🏃")
 st.title("Running Through Text")
-st.caption("Slice 4 — onboarding wizard + Cooper fallback")
+st.caption("Slice 6 — M3 memory + coach_note")
 
 query_params = st.query_params
 if "user_id" in query_params:
@@ -62,8 +66,19 @@ if prompt := st.chat_input("Conta como tá hoje..."):
     save_message(user_id, "user", prompt)
 
     history_for_llm = messages + [{"role": "user", "content": prompt}]
+    tool_calls_seen: set[str] = set()
     with st.chat_message("assistant"):
         with st.spinner("..."):
-            reply = call_coach_with_tools(history_for_llm, user_id=user_id)
+            reply = call_coach_with_tools(
+                history_for_llm,
+                user_id=user_id,
+                tool_calls_seen=tool_calls_seen,
+            )
         st.markdown(reply)
     save_message(user_id, "assistant", reply)
+
+    # Slice 6: coach-note rewrite happens AFTER the reply renders. We skip
+    # it while the wizard is active — onboarding turns have no narrative
+    # worth maintaining yet, and the rewrite would just be noise.
+    if profile_status["blocking_complete"]:
+        maybe_update_coach_note(user_id, tool_calls_seen)

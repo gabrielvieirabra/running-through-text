@@ -401,6 +401,160 @@ def recent_volume(user_id: str, days: int) -> dict:
     }
 
 
+def load_active_injuries(user_id: str) -> list[dict]:
+    """Return active injuries (status='active') for the runner, newest first."""
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, name, side, year, status, notes, created_at
+            FROM injuries
+            WHERE user_id = %s AND status = 'active'
+            ORDER BY created_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+    return [
+        {
+            "id": str(r[0]),
+            "name": r[1],
+            "side": r[2],
+            "year": r[3],
+            "status": r[4],
+            "notes": r[5],
+            "created_at": r[6],
+        }
+        for r in rows
+    ]
+
+
+def load_checkins_since(user_id: str, days: int) -> list[dict]:
+    """Check-ins within the last `days` days (date >= today - (days-1)), newest first."""
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, date, sleep_quality, fatigue, motivation, pains, notes, created_at
+            FROM checkins
+            WHERE user_id = %s
+              AND date >= CURRENT_DATE - (%s::int - 1)
+            ORDER BY date DESC, created_at DESC
+            """,
+            (user_id, days),
+        ).fetchall()
+    return [
+        {
+            "id": str(r[0]),
+            "date": r[1],
+            "sleep_quality": r[2],
+            "fatigue": r[3],
+            "motivation": r[4],
+            "pains": r[5],
+            "notes": r[6],
+            "created_at": r[7],
+        }
+        for r in rows
+    ]
+
+
+def load_workouts_since(user_id: str, days: int) -> list[dict]:
+    """Workouts within the last `days` days (date >= today - (days-1)), newest first."""
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, date, type, target_pace, zone,
+                   distance_km, duration_min, perceived_effort, notes, created_at
+            FROM workouts
+            WHERE user_id = %s
+              AND date >= CURRENT_DATE - (%s::int - 1)
+            ORDER BY date DESC, created_at DESC
+            """,
+            (user_id, days),
+        ).fetchall()
+    return [
+        {
+            "id": str(r[0]),
+            "date": r[1],
+            "type": r[2],
+            "target_pace": r[3],
+            "zone": r[4],
+            "distance_km": r[5],
+            "duration_min": r[6],
+            "perceived_effort": r[7],
+            "notes": r[8],
+            "created_at": r[9],
+        }
+        for r in rows
+    ]
+
+
+def save_coach_note(user_id: str, content: str, trigger: str) -> str:
+    """Persist a coach note row. Returns the new note's UUID as a string.
+
+    `trigger` must be one of the five values enforced by the schema CHECK:
+    `new_workout`, `risk_flag`, `idle`, `manual`, `bootstrap`. The note's
+    `generated_at` is set by the DB default (NOW()).
+    """
+    with connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO coach_notes (user_id, content, trigger)
+            VALUES (%s, %s, %s)
+            RETURNING id
+            """,
+            (user_id, content, trigger),
+        ).fetchone()
+    return str(row[0])
+
+
+def load_latest_coach_note(user_id: str) -> dict | None:
+    """Return the most recent coach note row for a runner, or None.
+
+    Result shape: `{id, content, generated_at, trigger}`.
+    """
+    with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id, content, generated_at, trigger
+            FROM coach_notes
+            WHERE user_id = %s
+            ORDER BY generated_at DESC
+            LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": str(row[0]),
+        "content": row[1],
+        "generated_at": row[2],
+        "trigger": row[3],
+    }
+
+
+def days_since_last_coach_note(user_id: str) -> int | None:
+    """Number of whole days since the runner's last coach note.
+
+    Returns None when the runner has no coach note yet — the caller should
+    interpret that as "bootstrap territory", not "0 days". Computed in SQL so
+    the runtime's clock skew vs the DB's clock doesn't matter.
+    """
+    with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT EXTRACT(EPOCH FROM (NOW() - generated_at)) / 86400.0
+            FROM coach_notes
+            WHERE user_id = %s
+            ORDER BY generated_at DESC
+            LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    # Truncate to whole days — "7+ days" reads off `>= 7`, not `>= 7.0`.
+    return int(row[0])
+
+
 def load_recent_checkins(user_id: str, limit: int = 10) -> list[dict]:
     """Most recent check-ins first, capped at `limit`. Pains arrive as a Python list."""
     with connection() as conn:

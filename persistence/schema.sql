@@ -4,7 +4,7 @@
 -- Slice 3: workouts (log of realized runs).
 -- Slice 4: running_profiles tightened with experience_level CHECK and a
 --          positive `injury_history_acknowledged` flag for onboarding gating.
--- Other tables (coach_notes) arrive in later slices.
+-- Slice 6: coach_notes (narrative summary, M3 memory per ADR 0001).
 
 CREATE TABLE users (
     id TEXT PRIMARY KEY,
@@ -109,3 +109,21 @@ CREATE TABLE workouts (
 );
 
 CREATE INDEX idx_workouts_user_date ON workouts (user_id, date);
+
+-- Coach notes: narrative summary written by the agent itself (ADR 0001 M3).
+-- The latest note is loaded as part of every turn's context preamble; older
+-- rows are kept for audit but never read by the agent. Triggers map to the
+-- mechanics in CONTEXT.md ("coach_note mechanics"): a new workout, a risk
+-- flag firing on a check-in, N days of idleness, an explicit `manual` push
+-- from the agent via `update_coach_note`, and a `bootstrap` regeneration.
+CREATE TABLE coach_notes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    trigger TEXT NOT NULL CHECK (
+        trigger IN ('new_workout', 'risk_flag', 'idle', 'manual', 'bootstrap')
+    )
+);
+
+CREATE INDEX idx_coach_notes_user_generated ON coach_notes (user_id, generated_at DESC);
